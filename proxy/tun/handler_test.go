@@ -3,11 +3,13 @@ package tun
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/features/routing"
@@ -101,6 +103,90 @@ func (d *testDispatcher) DispatchLink(ctx context.Context, dest xnet.Destination
 	buf.ReleaseMulti(mb)
 
 	return link.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(d.writePayload)})
+}
+
+type holdingDispatcher struct {
+	testDispatcher
+	release chan struct{}
+	uplink  chan []byte
+}
+
+func (d *holdingDispatcher) DispatchLink(ctx context.Context, dest xnet.Destination, link *transport.Link) error {
+	if err := d.testDispatcher.DispatchLink(ctx, dest, link); err != nil {
+		return err
+	}
+	if err := common.Close(link.Writer); err != nil {
+		return err
+	}
+	reader := &buf.BufferedReader{Reader: link.Reader}
+	payload := make([]byte, len("after EOF"))
+	if _, err := io.ReadFull(reader, payload); err != nil {
+		return err
+	}
+	d.uplink <- payload
+	<-d.release // like an outbound waiting for uplinkOnly
+	return nil
+}
+
+func TestHandlerHalfClosesTunConnectionWhenResponseEnds(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	common.Must(err)
+	defer listener.Close()
+	app, err := net.Dial("tcp", listener.Addr().String())
+	common.Must(err)
+	defer app.Close()
+	conn, err := listener.Accept()
+	common.Must(err)
+
+	release := make(chan struct{})
+	uplink := make(chan []byte, 1)
+	done := make(chan struct{})
+	defer func() {
+		close(release)
+		app.Close()
+		conn.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("handler did not finish")
+		}
+	}()
+	handler := &Handler{
+		ctx:             context.Background(),
+		config:          &Config{},
+		dispatcher:      &holdingDispatcher{testDispatcher: testDispatcher{writePayload: []byte("downlink")}, release: release, uplink: uplink},
+		uplinkCounter:   new(testCounter),
+		downlinkCounter: new(testCounter),
+	}
+	go func() {
+		defer close(done)
+		handler.HandleConnection(conn, xnet.TCPDestination(xnet.LocalHostIP, 443))
+	}()
+
+	common.Must2(app.Write([]byte("uplink")))
+	common.Must(app.SetReadDeadline(time.Now().Add(time.Second)))
+	got, err := io.ReadAll(app)
+	if err != nil || string(got) != "downlink" {
+		t.Fatalf("unexpected response: got %q, %v, want %q and EOF", got, err, "downlink")
+	}
+	common.Must(app.SetWriteDeadline(time.Now().Add(time.Second)))
+	common.Must2(app.Write([]byte("after EOF")))
+	select {
+	case payload := <-uplink:
+		if string(payload) != "after EOF" {
+			t.Fatalf("unexpected uplink after EOF: %q", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("uplink stopped after response EOF")
+	}
+	select {
+	case <-done:
+		t.Fatal("handler ended before the uplink grace period")
+	default:
+	}
+	if got := handler.uplinkCounter.Value(); got != int64(len("uplinkafter EOF")) {
+		t.Fatalf("unexpected uplink counter after EOF: %d", got)
+	}
 }
 
 func TestHandlerCountsTunConnectionTraffic(t *testing.T) {
